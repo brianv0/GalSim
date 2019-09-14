@@ -16,7 +16,7 @@
 #    and/or other materials provided with the distribution.
 #
 from __future__ import print_function
-import sys,os,glob,re
+import sys,os,glob
 import platform
 import ctypes
 import ctypes.util
@@ -51,7 +51,7 @@ print('Python version = ',sys.version)
 py_version = "%d.%d"%sys.version_info[0:2]  # we check things based on the major.minor version.
 
 scripts = ['galsim', 'galsim_download_cosmos']
-scripts = [ os.path.join('bin',f) for f in scripts ]
+scripts = [os.path.join('bin',f) for f in scripts]
 
 def all_files_from(dir, ext=''):
     files = []
@@ -72,7 +72,7 @@ undef_macros = []
 if "--debug" in sys.argv:
     undef_macros+=['NDEBUG']
 
-copt =  {
+copt = {
     'gcc' : ['-O2','-msse2','-std=c++11','-fvisibility=hidden','-fopenmp'],
     'icc' : ['-O2','-msse2','-vec-report0','-std=c++11','-openmp'],
     'clang' : ['-O2','-msse2','-std=c++11',
@@ -85,7 +85,7 @@ copt =  {
                                 '-Wno-shorten-64-to-32','-fvisibility=hidden','-stdlib=libc++'],
     'unknown' : [],
 }
-lopt =  {
+lopt = {
     'gcc' : ['-fopenmp'],
     'icc' : ['-openmp'],
     'clang' : ['-stdlib=libc++'],
@@ -316,6 +316,26 @@ def find_eigen_dir(output=False):
     raise OSError("Could not find Eigen")
 
 
+def try_cmd(cmd, cmd_type):
+    try:
+        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        lines = p.stdout.readlines()
+        p.communicate()
+        if debug and p.returncode != 0:
+            print('Trying %s command:' % cmd_type)
+            print(' '.join(cmd))
+            print('Output was:')
+            print('   ', b'   '.join(lines).decode())
+        returncode = p.returncode
+    except (IOError, OSError) as e:
+        if debug:
+            print('Trying command:')
+            print(' '.join(cmd))
+            print('Caught error: ', repr(e))
+        returncode = 1
+    return returncode
+
+
 def try_compile(cpp_code, compiler, cflags=[], lflags=[], prepend=None):
     """Check if compiling some code with the given compiler and flags works properly.
     """
@@ -343,22 +363,8 @@ def try_compile(cpp_code, compiler, cflags=[], lflags=[], prepend=None):
     cmd = cc + compiler.compiler_so[1:] + cflags + ['-c',cpp_name,'-o',o_name]
     if debug:
         print('cmd = ',' '.join(cmd))
-    try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        lines = p.stdout.readlines()
-        p.communicate()
-        if debug and p.returncode != 0:
-            print('Trying compile command:')
-            print(' '.join(cmd))
-            print('Output was:')
-            print('   ',b'   '.join(lines).decode())
-        returncode = p.returncode
-    except (IOError,OSError) as e:
-        if debug:
-            print('Trying compile command:')
-            print(cmd)
-            print('Caught error: ',repr(e))
-        returncode = 1
+
+    returncode = try_cmd(cmd, "compile")
     if returncode != 0:
         # Don't delete files in case helpful for troubleshooting.
         return False
@@ -368,22 +374,8 @@ def try_compile(cpp_code, compiler, cflags=[], lflags=[], prepend=None):
     cmd = [cc] + compiler.linker_so[1:] + lflags + [o_name,'-o',exe_name]
     if debug:
         print('cmd = ',' '.join(cmd))
-    try:
-        p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-        lines = p.stdout.readlines()
-        p.communicate()
-        if debug and p.returncode != 0:
-            print('Trying link command:')
-            print(' '.join(cmd))
-            print('Output was:')
-            print('   ',b'   '.join(lines).decode())
-        returncode = p.returncode
-    except (IOError,OSError) as e:
-        if debug:
-            print('Trying link command:')
-            print(' '.join(cmd))
-            print('Caught error: ',repr(e))
-        returncode = 1
+
+    returncode = try_cmd(cmd, "link")
 
     if returncode:
         # The linker needs to be a c++ linker, which isn't 'cc'.  However, I couldn't figure
@@ -413,25 +405,12 @@ def try_compile(cpp_code, compiler, cflags=[], lflags=[], prepend=None):
                 cpp = 'g++'
             else:
                 cpp = 'c++'
+        # Override with CXX, if available
+        cpp = os.environ.get('CXX', cpp)
         cmd = [cpp] + compiler.linker_so[1:] + lflags + [o_name,'-o',exe_name]
         if debug:
             print('cmd = ',' '.join(cmd))
-        try:
-            p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            lines = p.stdout.readlines()
-            p.communicate()
-            if debug and p.returncode != 0:
-                print('Trying link command:')
-                print(' '.join(cmd))
-                print('Output was:')
-                print('   ',b'   '.join(lines).decode())
-            returncode = p.returncode
-        except (IOError,OSError) as e:
-            if debug:
-                print('Trying to link using command:')
-                print(' '.join(cmd))
-                print('Caught error: ',repr(e))
-            returncode = 1
+        returncode = try_cmd(cmd, "link")
 
     # Remove the temp files
     if returncode != 0:
@@ -859,13 +838,15 @@ class my_test(test):
         cflags, lflags = fix_compiler(compiler, False)
 
         ext = builder.extensions[0]
-        objects = compiler.compile(test_sources,
-                output_dir=builder.build_temp,
-                macros=ext.define_macros,
-                include_dirs=ext.include_dirs,
-                debug=builder.debug,
-                extra_postargs=ext.extra_compile_args + cflags,
-                depends=ext.depends)
+        objects = compiler.compile(
+            test_sources,
+            output_dir=builder.build_temp,
+            macros=ext.define_macros,
+            include_dirs=ext.include_dirs,
+            debug=builder.debug,
+            extra_postargs=ext.extra_compile_args + cflags,
+            depends=ext.depends
+        )
 
         if ext.extra_objects:
             objects.extend(ext.extra_objects)
@@ -931,12 +912,6 @@ class my_test(test):
             errno = pytest.main(pytest_args + test_files)
             if errno != 0:
                 raise RuntimeError("Some Python tests failed")
-        else:
-            # Alternate method calls pytest executable.  But the above code seems to work.
-            p = subprocess.Popen(['pytest'] + pytest_args + test_files)
-            p.communicate()
-            if p.returncode != 0:
-                raise RuntimeError("Some Python tests failed")
         os.chdir(original_dir)
         print("All python tests passed.")
 
@@ -966,7 +941,7 @@ try:
 except OSError:
     print('Adding eigency to build_dep')
     # Once 1.78 is out I *think* we can remove the cython dependency here.
-    build_dep += ['cython', 'eigency>=1.77']
+    build_dep += ['cython']
 
 
 with open('README.rst') as file:
@@ -1023,7 +998,8 @@ with open(version_h_file, 'w') as f:
 
 headers.append(version_h_file)
 
-dist = setup(name="GalSim",
+dist = setup(
+    name="GalSim",
     version=galsim_version,
     author="GalSim Developers (point of contact: Mike Jarvis)",
     author_email="michael@jarvis.net",

@@ -20,10 +20,12 @@ import sys,os,glob
 import platform
 import ctypes
 import ctypes.util
-import types
 import subprocess
 import re
 import tempfile
+import types
+import distutils
+from distutils.ccompiler import DistutilsSetupError
 
 try:
     from setuptools import setup, Extension, find_packages
@@ -632,35 +634,46 @@ def fix_compiler(compiler, njobs):
     print('Using extra flags ',extra_cflags)
     return extra_cflags, extra_lflags
 
-def add_dirs(builder, output=False):
+
+# The first time we run find_dirs, we output the information
+FIND_DIRS_EXECUTED = False
+
+def find_dirs():
+    output = False
+    global FIND_DIRS_EXECUTED
+    if not FIND_DIRS_EXECUTED:
+        output = True
+        FIND_DIRS_EXECUTED = True
+
     if debug: output = True
     # We need to do most of this both for build_clib and build_ext, so separate it out here.
 
+    _include_dirs = []
+    _libraries = []
+    _library_dirs = []
+
     # First some basic ones we always need.
-    builder.include_dirs.append('include')
-    builder.include_dirs.append('include/galsim')
+    _include_dirs.append('include')
 
     # Look for fftw3.
     fftw_lib = find_fftw_lib(output=output)
     fftw_libpath, fftw_libname = os.path.split(fftw_lib)
-    if hasattr(builder, 'library_dirs'):
-        if fftw_libpath != '':
-            builder.library_dirs.append(fftw_libpath)
-        builder.libraries.append('galsim')  # Make sure galsim comes before fftw3
-        builder.libraries.append(os.path.split(fftw_lib)[1].split('.')[0][3:])
+    if fftw_libpath != '':
+        _library_dirs.append(fftw_libpath)
+    _libraries.append(os.path.split(fftw_lib)[1].split('.')[0][3:])
     fftw_include = os.path.join(os.path.split(fftw_libpath)[0], 'include')
     if os.path.isfile(os.path.join(fftw_include, 'fftw3.h')):
         print('Include directory for fftw3 is ',fftw_include)
         # Usually, the fftw3.h file is in an associated include dir, but not always.
-        builder.include_dirs.append(fftw_include)
+        _include_dirs.append(fftw_include)
     else:
         # If not, we have our own copy of fftw3.h here.
         print('Using local copy of fftw3.h')
-        builder.include_dirs.append('include/fftw3')
+        _include_dirs.append('include/fftw3')
 
     # Look for Eigen/Core
     eigen_dir = find_eigen_dir(output=output)
-    builder.include_dirs.append(eigen_dir)
+    _include_dirs.append(eigen_dir)
 
     # Finally, add pybind11's include dir
     import pybind11
@@ -684,10 +697,12 @@ def add_dirs(builder, output=False):
         print('  ',try_dir,end='')
         if os.path.isfile(os.path.join(try_dir, 'pybind11/pybind11.h')):
             print('  (yes)')
-            builder.include_dirs.append(try_dir)
+            _include_dirs.append(try_dir)
             break
         else:
             print('  (no)')
+    return _include_dirs, _library_dirs, _libraries
+
 
 def parse_njobs(njobs, task=None, command=None, maxn=4):
     """Helper function to parse njobs, which may be None (use ncpu) or an int.
@@ -714,13 +729,12 @@ def parse_njobs(njobs, task=None, command=None, maxn=4):
                 print('Using %d cpus for %s'%(njobs,task))
     return njobs
 
-do_output = True  # Keep track of whether we used output=True in add_dirs yet.
-                  # It seems that different installation methods do things in different order,
-                  # but we only want to output on the first pass through add_dirs.
-                  # (Unless debug = True, then also output in the second pass.)
 
 # Make a subclass of build_ext so we can add to the -I list.
 class my_build_clib(build_clib):
+    """
+    Normal variant for building a library (static)
+    """
     user_options = build_ext.user_options + [('njobs=', 'j', "Number of jobs to use for compiling")]
 
     def initialize_options(self):
@@ -733,24 +747,134 @@ class my_build_clib(build_clib):
         if self.njobs is None and 'glob_njobs' in globals():
             global glob_njobs
             self.njobs = glob_njobs
-        add_dirs(self, output=do_output)
+        # Add galsim, built with build_clib, first. Found dirs/libraries are appended.
+        self.include_dirs.append("include/galsim")
+        include_dirs, library_dirs, libraries = find_dirs()
+        self.include_dirs += include_dirs
         do_output = False
 
     # Add any extra things based on the compiler being used..
     def build_libraries(self, libraries):
 
-        build_ext = self.distribution.get_command_obj('build_ext')
+        build_clib = self.distribution.get_command_obj('build_clib')
         njobs = parse_njobs(self.njobs, 'compiling', 'install')
 
         cflags, lflags = fix_compiler(self.compiler, njobs)
 
         # Add the appropriate extra flags for that compiler.
         for (lib_name, build_info) in libraries:
-            build_info['cflags'] = build_info.get('cflags',[]) + cflags
-            build_info['lflags'] = build_info.get('lflags',[]) + lflags
+            build_info['cflags'] = build_info.get('cflags', []) + cflags
+            build_info['lflags'] = build_info.get('lflags', []) + lflags
 
         # Now run the normal build function.
         build_clib.build_libraries(self, libraries)
+
+
+class my_shared_build_clib(build_clib):
+    """
+    distutils.Command for building a shared clib
+    """
+
+    def initialize_options(self):
+        build_clib.initialize_options(self)
+
+    def finalize_options(self):
+        global do_output
+        build_clib.finalize_options(self)
+        do_output = False
+
+    # Add any extra things based on the compiler being used..
+    def build_libraries(self, libraries):
+        _cflags, _ldflags = fix_compiler(self.compiler, 1)
+
+        # Much of this is copied from setuptools.build_clib
+        for (lib_name, build_info) in libraries:
+            # Normalize build_info
+            for key in ["include_dirs", "define_macros", "undef_macros", "library_dirs",
+                        "libraries", "runtime_library_dirs", "extra_objects", "extra_compile_args",
+                        "extra_link_args", "export_symbols", "depends"]:
+                build_info.setdefault(key, [])
+            cflags = build_info.get("cflags", []) + _cflags
+            include_dirs = build_info.get("include_dirs", []) + self.include_dirs
+            library_dirs = build_info.get("library_dirs", [])
+            link_libraries = build_info.get("libraries", [])
+            ldflags = build_info.get("ldflags", []) + _ldflags
+            # Make sure everything is the correct type.
+            # obj_deps should be a dictionary of keys as sources
+            # and a list/tuple of files that are its dependencies.
+            obj_deps = build_info.get('obj_deps', dict())
+            if not isinstance(obj_deps, dict):
+                raise DistutilsSetupError(
+                       "in 'libraries' option (library '%s'), "
+                       "'obj_deps' must be a dictionary of "
+                       "type 'source: list'" % lib_name)
+
+            sources = build_info.get('sources')
+            if sources is None or not isinstance(sources, (list, tuple)):
+                raise DistutilsSetupError(
+                       "in 'libraries' option (library '%s'), "
+                       "'sources' must be present and must be "
+                       "a list of source filenames" % lib_name)
+            sources = list(sources)
+
+            # Get the global dependencies that are specified by the '' key.
+            # These will go into every source's dependency list.
+            global_deps = obj_deps.get('', list())
+            if not isinstance(global_deps, (list, tuple)):
+                raise DistutilsSetupError(
+                       "in 'libraries' option (library '%s'), "
+                       "'obj_deps' must be a dictionary of "
+                       "type 'source: list'" % lib_name)
+
+            print("building '%s' library", lib_name)
+
+            dependencies = []
+
+            # Build the list to be used by newer_pairwise_group
+            # each source will be auto-added to its dependencies.
+            for source in sources:
+                src_deps = [source]
+                src_deps.extend(global_deps)
+                dependencies.append(src_deps)
+
+            objects = self.compiler.object_filenames(
+                sources,
+                output_dir=self.build_temp
+            )
+
+            outdated = [s for s, o in zip(sources, objects)
+                        if distutils.dep_util.newer(s, o) or
+                        distutils.dep_util.newer_group(headers, o)]
+            if outdated:
+                macros = build_info.get('macros')
+                undef_macros = build_info.get('undef_macros')
+                depends = build_info.get('depends')
+                macros = macros
+                for undef in undef_macros:
+                    macros.append((undef,))
+
+                self.compiler.compile(
+                    outdated,
+                    output_dir=self.build_temp,
+                    include_dirs=include_dirs,
+                    macros=macros,
+                    extra_postargs=cflags,
+                    depends=depends,
+                    )
+            libpath = os.path.join(
+                self.build_clib, self.compiler.library_filename(lib_name, lib_type='shared'))
+            if distutils.dep_util.newer_group(objects, libpath):
+                self.compiler.link_shared_lib(
+                    objects,
+                    lib_name,
+                    libraries=link_libraries,
+                    library_dirs=library_dirs,
+                    extra_postargs=cflags + ldflags,
+                    debug=self.debug,
+                    build_temp=self.build_temp,
+                    output_dir=self.build_clib,
+                )
+
 
 
 # Make a subclass of build_ext so we can add to the -I list.
@@ -769,7 +893,7 @@ class my_build_ext(build_ext):
         if self.njobs is None and 'glob_njobs' in globals():
             global glob_njobs
             self.njobs = glob_njobs
-        add_dirs(self, output=do_output)
+
         do_output = False
 
     # Add any extra things based on the compiler being used..
@@ -919,14 +1043,22 @@ class my_test(test):
         self.run_cpp_tests()
 
 
+include_dirs, library_dirs, libraries = find_dirs()
 lib=("galsim", {'sources' : cpp_sources,
                 'depends' : headers,
-                'include_dirs' : ['include', 'include/galsim'],
+                'include_dirs' : include_dirs + ['include', 'include/galsim'],
+                'libraries' : libraries,
+                'library_dirs' : library_dirs,
                 'undef_macros' : undef_macros })
+
 ext=Extension("galsim._galsim",
               py_sources,
-              depends = cpp_sources + headers,
-              undef_macros = undef_macros)
+              include_dirs=include_dirs + ["include/galsim"],
+              libraries=libraries + ["galsim"],
+              library_dirs=library_dirs,
+              runtime_library_dirs=["$ORIGIN"],
+              depends=cpp_sources + headers,
+              undef_macros=undef_macros)
 
 build_dep = ['setuptools>=38', 'pybind11>=2.2']
 run_dep = ['numpy', 'future', 'astropy', 'LSSTDESC.Coord']
@@ -1016,7 +1148,7 @@ dist = setup(
     install_requires=build_dep + run_dep,
     tests_require=test_dep,
     cmdclass = {'build_ext': my_build_ext,
-                'build_clib': my_build_clib,
+                'build_clib': my_shared_build_clib,
                 'install': my_install,
                 'install_scripts': my_install_scripts,
                 'easy_install': my_easy_install,

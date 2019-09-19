@@ -26,6 +26,7 @@ import tempfile
 import types
 import distutils
 from distutils.ccompiler import DistutilsSetupError
+from distutils.sysconfig import customize_compiler, get_config_var
 
 try:
     from setuptools import setup, Extension, find_packages
@@ -75,16 +76,16 @@ if "--debug" in sys.argv:
     undef_macros+=['NDEBUG']
 
 copt = {
-    'gcc' : ['-O2','-msse2','-std=c++11','-fvisibility=hidden','-fopenmp'],
+    'gcc' : ['-O2','-msse2','-std=c++11','-fopenmp'],
     'icc' : ['-O2','-msse2','-vec-report0','-std=c++11','-openmp'],
     'clang' : ['-O2','-msse2','-std=c++11',
-               '-Wno-shorten-64-to-32','-fvisibility=hidden','-stdlib=libc++'],
+               '-Wno-shorten-64-to-32','-stdlib=libc++'],
     'clang w/ OpenMP' : ['-O2','-msse2','-std=c++11','-fopenmp',
-                         '-Wno-shorten-64-to-32','-fvisibility=hidden','-stdlib=libc++'],
+                         '-Wno-shorten-64-to-32','-stdlib=libc++'],
     'clang w/ Intel OpenMP' : ['-O2','-msse2','-std=c++11','-Xpreprocessor','-fopenmp',
-                                '-Wno-shorten-64-to-32','-fvisibility=hidden','-stdlib=libc++'],
+                                '-Wno-shorten-64-to-32','-stdlib=libc++'],
     'clang w/ manual OpenMP' : ['-O2','-msse2','-std=c++11','-Xpreprocessor','-fopenmp',
-                                '-Wno-shorten-64-to-32','-fvisibility=hidden','-stdlib=libc++'],
+                                '-Wno-shorten-64-to-32','-stdlib=libc++'],
     'unknown' : [],
 }
 lopt = {
@@ -289,6 +290,7 @@ def find_eigen_dir(output=False):
         if path in os.environ:
             for dir in os.environ[path].split(':'):
                 try_dirs.append(dir)
+
     # eigency is a python package that bundles the Eigen header files, so if that's there,
     # can use that.
     try:
@@ -296,7 +298,6 @@ def find_eigen_dir(output=False):
         try_dirs.append(eigency.get_includes()[2])
     except ImportError:
         pass
-
     if output: print("Looking for Eigen:")
     for dir in try_dirs:
         if not os.path.isdir(dir): continue
@@ -779,15 +780,67 @@ class my_shared_build_clib(build_clib):
         build_clib.initialize_options(self)
 
     def finalize_options(self):
-        global do_output
+        # Override build_lib default (default to build_lib)
+        # This is probably wrong for most packaging
+        self.set_undefined_options('build', ('build_lib', 'build_clib'))
         build_clib.finalize_options(self)
+        global do_output
         do_output = False
+
+    # make sure _config_vars is initialized
+    def _customize_compiler_for_shlib(self):
+        # Pulled from setuptools.build_ext
+        # Ensures _config_vars is initialized
+        get_config_var("LDSHARED")
+        from distutils.sysconfig import _config_vars as _CONFIG_VARS
+        if sys.platform == "darwin":
+            # building .dylib requires additional compiler flags on OSX; here we
+            # temporarily substitute the pyconfig.h variables so that distutils'
+            # 'customize_compiler' uses them before we build the shared libraries.
+            tmp = _CONFIG_VARS.copy()
+            try:
+                # XXX Help!  I don't have any idea whether these are right...
+                _CONFIG_VARS['LDSHARED'] = (
+                    "gcc -Wl,-x -dynamiclib -undefined dynamic_lookup")
+                _CONFIG_VARS['CCSHARED'] = " -dynamiclib"
+                _CONFIG_VARS['SO'] = ".dylib"
+                customize_compiler(self.compiler)
+            finally:
+                _CONFIG_VARS.clear()
+                _CONFIG_VARS.update(tmp)
+        else:
+            customize_compiler(self.compiler)
+
+    def run(self):
+        # This is copied so I can use _customize_compiler_for_shlib
+        if not self.libraries:
+            return
+
+        # Yech -- this is cut 'n pasted from build_ext.py!
+        from distutils.ccompiler import new_compiler
+        self.compiler = new_compiler(compiler=self.compiler,
+                                     dry_run=self.dry_run,
+                                     force=self.force)
+        self._customize_compiler_for_shlib()
+
+        if self.include_dirs is not None:
+            self.compiler.set_include_dirs(self.include_dirs)
+        if self.define is not None:
+            # 'define' option is a list of (name,value) tuples
+            for (name, value) in self.define:
+                self.compiler.define_macro(name, value)
+        if self.undef is not None:
+            for macro in self.undef:
+                self.compiler.undefine_macro(macro)
+
+        self.build_libraries(self.libraries)
 
     # Add any extra things based on the compiler being used..
     def build_libraries(self, libraries):
         _cflags, _ldflags = fix_compiler(self.compiler, 1)
 
         # Much of this is copied from setuptools.build_clib
+        # Some of it is copied from setuptools.build_ext
         for (lib_name, build_info) in libraries:
             # Normalize build_info
             for key in ["include_dirs", "define_macros", "undef_macros", "library_dirs",
@@ -861,12 +914,19 @@ class my_shared_build_clib(build_clib):
                     extra_postargs=cflags,
                     depends=depends,
                     )
+            # I think this should be a test - if darwin, then 'dylib' else 'shared'
+            full_libname = self.compiler.library_filename(lib_name, lib_type='shared')
             libpath = os.path.join(
                 self.build_clib, self.compiler.library_filename(lib_name, lib_type='shared'))
             if distutils.dep_util.newer_group(objects, libpath):
-                self.compiler.link_shared_lib(
+                # cflags/ldflags should probably be different
+                # If they were appropriate per-compiler/platform, then we wouldn't need
+                # _customize_compiler_for_shlib
+                cflags.append("-dynamiclib")
+                ldflags.append("-dynamiclib")
+                self.compiler.link_shared_object(
                     objects,
-                    lib_name,
+                    lib_name, # I think this should be full_libname
                     libraries=link_libraries,
                     library_dirs=library_dirs,
                     extra_postargs=cflags + ldflags,
